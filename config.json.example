@@ -1,0 +1,10 @@
+{
+  "accounts": [
+    {
+      "enabled": false,
+      "host": "mail.example.jp",
+      "user": "info@example.jp",
+      "password": "secret"
+    }
+  ]
+}
