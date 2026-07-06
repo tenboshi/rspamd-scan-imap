@@ -93,7 +93,7 @@ pip install imap-tools==1.13.0
      └─ [spam_folder スキャン] ※設定時のみ
          last_spam_uid 以降のUID一覧を取得
          ↓ 1通ずつフェッチ
-         learn_spam（フォルダ移動なし）
+         learn_spam → junk_folder へ移動
          処理のたびに last_spam_uid を保存
 ```
 
