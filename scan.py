@@ -13,7 +13,7 @@
      "ham"/"greylist" あるいは "no action" ならHAMとして指定フォルダへ移動 + learn_ham。
   4. notspam_folder / spam_folderが設定されていれば、それらも同様に処理する。
      notspam_folder は HAM学習用（手動で「スパムでない」とマークされたメール）、
-     spam_folder は SPAM学習用（手動で「スパム」とマークされたメール）。
+     spam_folder は SPAM学習用（手動で「スパム」とマークされたメール → learn_spam 後、Junkへ移動）。
 
 state_file の設計:
   user@domain → state/state_state__at_domain_.json に保存。
@@ -710,7 +710,8 @@ def process_account(account, logger, dry_run=False):
 
 
         # ==== 3. spam_folder の処理（手動SPAM学習用） ====
-        # spam_folder に溜まったメールを learn_spam する。
+        # spam_folder に溜まったメールを learn_spam した後、junk_folder へ移動する。
+        # これにより spam_folder が空になり、次回再取得されない。
         # notspam_folder と同じく watermark = max(prev, uid) で安全に再取得回避。
         if spam_folder:
             logger.info("Processing spam_folder: %s", spam_folder)
@@ -743,10 +744,21 @@ def process_account(account, logger, dry_run=False):
                     suid, msg.subject or "", spam_folder,
                 )
 
+                # rspamd にスパムとして学習
                 try:
                     learn_spam(msg.obj.as_bytes(), rspamc_timeout)
                 except Exception as le:
                     logger.warning("LEARN_SPAM UID=%d failed: %s", suid, le)
+
+                # 学習済み → junk_folder へ移動（spam_folder は空にする）
+                if not dry_run and junk_folder:
+                    try:
+                        fetcher.move(msg.uid, junk_folder)
+                    except Exception as move_exc:
+                        logger.error(
+                            "LEARN_SPAM UID=%d move to %s failed: %s",
+                            suid, junk_folder, move_exc,
+                        )
 
                 spam_max = max(spam_max, suid)
                 if not dry_run:
