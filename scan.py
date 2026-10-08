@@ -105,7 +105,12 @@ def load_state(user):
     """
     path = state_file_path(user)
     if not path.exists():
-        return {"last_uid": 0, "last_spam_uid": 0, "last_notspam_uid": 0}
+        return {
+            "last_uid": 0,
+            "last_spam_uid": 0,
+            "last_notspam_uid": 0,
+            "notspam_senders": [],
+        }
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
     # 古いキーを無視して削除（後方互換）
@@ -116,6 +121,7 @@ def load_state(user):
     data.setdefault("last_uid", 0)
     data.setdefault("last_spam_uid", 0)
     data.setdefault("last_notspam_uid", 0)
+    data.setdefault("notspam_senders", [])
     return data
 
 
@@ -131,9 +137,19 @@ def save_state(user, state):
         "last_uid": state.get("last_uid", 0),
         "last_spam_uid": state.get("last_spam_uid", 0),
         "last_notspam_uid": state.get("last_notspam_uid", 0),
+        "notspam_senders": sorted(set(state.get("notspam_senders", []))),
     }
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
+
+
+def normalize_sender(msg):
+    """メッセージの From アドレスを小文字・前後空白除去で正規化して返す。
+
+    imap_tools の msg.from_ は表示名を除いたアドレス部分のみ。
+    取得できない場合は空文字列を返す（スキップ対象にはしない）。
+    """
+    return (getattr(msg, "from_", "") or "").strip().lower()
 
 
 def setup_logging():
@@ -565,6 +581,9 @@ def process_account(account, logger, dry_run=False):
         uid_list = fetcher.list_uids(max_uid + 1)
         logger.info("Found %d UID(s) to process in %s", len(uid_list), inbox_folder)
 
+        # notspam_folder で学習済みの送信元（Fromアドレス）。INBOXではスキャンをスキップする。
+        notspam_senders = set(state.get("notspam_senders", []))
+
         for uid in uid_list:
             msg = fetcher.fetch_uid(uid)       # UID で個別フェッチ（本文あり）
             if msg is None:
@@ -577,6 +596,33 @@ def process_account(account, logger, dry_run=False):
                 continue
 
             fetched_count += 1
+
+            # ==== notspam 送信元ならスキャン・移動・学習を全てスキップ（INBOXに残す） ====
+            sender = normalize_sender(msg)
+            if sender and sender in notspam_senders:
+                if ham_folder:
+                    logger.info(
+                        "UID=%d FROM=%s SUBJECT=%s -> SKIP scan (sender in notspam list), move to %s",
+                        uid, sender, msg.subject or "", ham_folder,
+                    )
+                    if not dry_run:
+                        try:
+                            fetcher.move(msg.uid, ham_folder)
+                        except Exception as move_exc:
+                            logger.error(
+                                "UID=%d move to %s failed: %s",
+                                uid, ham_folder, move_exc,
+                            )
+                else:
+                    logger.info(
+                        "UID=%d FROM=%s SUBJECT=%s -> SKIP scan (sender in notspam list, kept in INBOX)",
+                        uid, sender, msg.subject or "",
+                    )
+                max_uid = max(max_uid, uid)
+                if not dry_run:
+                    state["last_uid"] = max_uid
+                    save_state(user, state)
+                continue
 
             # rspamd スキャン（msg.obj.as_bytes() でメール全文をbytes化）
             try:
@@ -629,11 +675,8 @@ def process_account(account, logger, dry_run=False):
                     logger.warning(
                         "UID=%d HAM but no ham_folder configured -> skip move", uid,
                     )
-
-                try:
-                    learn_ham(msg.obj.as_bytes(), rspamc_timeout)
-                except Exception:
-                    pass   # 学習失敗は無視（すでに学習済みなど）
+                # NOTE: INBOXのHAM判定メールは learn_ham しない（自己学習による偏り防止）。
+                #       HAM学習は notspam_folder の手動確認済みメールのみ。
 
             # ==== 未知のアクション ====
             else:
@@ -698,6 +741,15 @@ def process_account(account, logger, dry_run=False):
                 except Exception as le:
                     logger.warning("LEARN_HAM UID=%d failed: %s", nuid, le)
 
+                # 送信元アドレスを stat に記録（次回以降、INBOXスキャン時にスキップされる）。
+                # state への書き込みは下の save_state() で永続化される（dry_run時は保存されない）。
+                sender = normalize_sender(msg)
+                if sender:
+                    senders = state.setdefault("notspam_senders", [])
+                    if sender not in senders:
+                        senders.append(sender)
+                        logger.info("Registered notspam sender: %s", sender)
+
                 if not dry_run:
                     fetcher.move(msg.uid, dest)             # move先へ移動（dry_runならなし）
 
@@ -749,6 +801,15 @@ def process_account(account, logger, dry_run=False):
                     learn_spam(msg.obj.as_bytes(), rspamc_timeout)
                 except Exception as le:
                     logger.warning("LEARN_SPAM UID=%d failed: %s", suid, le)
+
+                # 手動でスパム判定された送信元は notspam_senders から取り消す
+                # （次回以降は通常どおり rspamd でスキャンされる）。
+                # 永続化は下の save_state() で行われる（dry_run時は保存されない）。
+                sender = normalize_sender(msg)
+                senders = state.get("notspam_senders", [])
+                if sender and sender in senders:
+                    senders.remove(sender)
+                    logger.info("Unregistered notspam sender: %s", sender)
 
                 # 学習済み → junk_folder へ移動（spam_folder は空にする）
                 if not dry_run and junk_folder:
