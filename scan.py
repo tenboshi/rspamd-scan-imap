@@ -524,7 +524,8 @@ def process_account(account, logger, dry_run=False):
       5. spam_folder が設定されていたら、そこに溜まったメッセージを learn_spam。
 
     dry_run=True の場合:
-        メールは移動されない（状態ファイルも更新されない）。ログのみ出力される。
+        メールの移動・rspamd への学習（learn_spam / learn_ham）・状態ファイルの更新は
+        いずれも行われない。rspamd のスキャン（読み取りのみ）とログ出力だけが行われる。
 
     state_file に記録される key:
         last_uid       : INBOX で最後に処理した UID の最大値
@@ -644,18 +645,19 @@ def process_account(account, logger, dry_run=False):
                     "UID=%d SCORE=%.2f ACTION=%s SUBJECT=%s -> SPAM (to Junk)",
                     uid, score, action, msg.subject or "",
                 )
-                try:
-                    fetcher.move(msg.uid, junk_folder)
-                except Exception as move_exc:
-                    logger.error(
-                        "UID=%d move to %s failed: %s",
-                        uid, junk_folder, move_exc,
-                    )
+                if not dry_run:
+                    try:
+                        fetcher.move(msg.uid, junk_folder)
+                    except Exception as move_exc:
+                        logger.error(
+                            "UID=%d move to %s failed: %s",
+                            uid, junk_folder, move_exc,
+                        )
 
-                try:
-                    learn_spam(msg.obj.as_bytes(), rspamc_timeout)
-                except Exception as learn_exc:
-                    logger.warning("UID=%d learn_spam failed: %s", uid, learn_exc)
+                    try:
+                        learn_spam(msg.obj.as_bytes(), rspamc_timeout)
+                    except Exception as learn_exc:
+                        logger.warning("UID=%d learn_spam failed: %s", uid, learn_exc)
 
             # ==== HAM パス (ham / greylist / no action) ====
             elif action in ACTIONS_HAM or action == "no action":
@@ -736,10 +738,11 @@ def process_account(account, logger, dry_run=False):
                     nuid, msg.subject or "", notspam_folder,
                 )
 
-                try:
-                    learn_ham(msg.obj.as_bytes(), rspamc_timeout)   # rspamd に HAM 学習させる
-                except Exception as le:
-                    logger.warning("LEARN_HAM UID=%d failed: %s", nuid, le)
+                if not dry_run:
+                    try:
+                        learn_ham(msg.obj.as_bytes(), rspamc_timeout)   # rspamd に HAM 学習させる
+                    except Exception as le:
+                        logger.warning("LEARN_HAM UID=%d failed: %s", nuid, le)
 
                 # 送信元アドレスを stat に記録（次回以降、INBOXスキャン時にスキップされる）。
                 # state への書き込みは下の save_state() で永続化される（dry_run時は保存されない）。
@@ -751,7 +754,15 @@ def process_account(account, logger, dry_run=False):
                         logger.info("Registered notspam sender: %s", sender)
 
                 if not dry_run:
-                    fetcher.move(msg.uid, dest)             # move先へ移動（dry_runならなし）
+                    # move先へ移動（dry_runならなし）。失敗してもアカウント処理は中断せず、
+                    # エラーログを出して次のメールへ進む（watermark は進める）。
+                    try:
+                        fetcher.move(msg.uid, dest)
+                    except Exception as move_exc:
+                        logger.error(
+                            "LEARN_HAM UID=%d move to %s failed: %s",
+                            nuid, dest, move_exc,
+                        )
 
                 notspam_max = max(notspam_max, nuid)
                 if not dry_run:
@@ -796,11 +807,12 @@ def process_account(account, logger, dry_run=False):
                     suid, msg.subject or "", spam_folder,
                 )
 
-                # rspamd にスパムとして学習
-                try:
-                    learn_spam(msg.obj.as_bytes(), rspamc_timeout)
-                except Exception as le:
-                    logger.warning("LEARN_SPAM UID=%d failed: %s", suid, le)
+                # rspamd にスパムとして学習（dry_runならなし）
+                if not dry_run:
+                    try:
+                        learn_spam(msg.obj.as_bytes(), rspamc_timeout)
+                    except Exception as le:
+                        logger.warning("LEARN_SPAM UID=%d failed: %s", suid, le)
 
                 # 手動でスパム判定された送信元は notspam_senders から取り消す
                 # （次回以降は通常どおり rspamd でスキャンされる）。
